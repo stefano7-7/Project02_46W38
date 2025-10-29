@@ -3,16 +3,24 @@ import matplotlib.pyplot as plt
 from scipy.interpolate import interp1d
 import os
 from dataclasses import dataclass
+from pathlib import Path
+from scipy.integrate import solve_ivp
 
-def Ct_look_up_and_interp(path, kind='linear', plot=True):
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import interp1d
+
+def get_Ct(path, ws, kind='linear', plot=True, show_arrows=True, ax=None):
     """
-    Legge il file C_T.txt, crea la funzione interpolante e (opzionalmente) plottala.
+    reads the look-up table, 
+    creates interpolating func calculating the thrust coeff for a given w/s
+    plot
     """
-    # --- Caricamento dati ---
+    # Caricamento robusto (salta 1 riga di header se presente)
     data = np.loadtxt(path, comments="#", skiprows=1)
     U_tab, Ct_tab = data[:, 0], data[:, 1]
 
-    # --- Interpolazione ---
+    # Interpolante con extrapolation clamp (estende i bordi)
     get_Ct = interp1d(
         U_tab, Ct_tab,
         kind=kind,
@@ -20,32 +28,54 @@ def Ct_look_up_and_interp(path, kind='linear', plot=True):
         fill_value=(Ct_tab[0], Ct_tab[-1])
     )
 
+    Ct_at_U = float(get_Ct(ws))
+
     if plot:
-        # more points for plotting
-        U_fine = np.linspace(U_tab.min(), U_tab.max(), 200)
+        created_fig = False
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(7, 4))
+            created_fig = True
+
+        # Curva “lisciata” per il plot
+        U_fine = np.linspace(U_tab.min(), U_tab.max(), 300)
         Ct_fine = get_Ct(U_fine)
 
-        plt.figure(figsize=(7, 4))
-        plt.plot(U_tab, Ct_tab, 'o', label='Look-up table')
-        plt.plot(U_fine, Ct_fine, '-', label=f'Interpolation {kind}', linewidth=2)
-        plt.xlabel("Wind speed U [m/s]")
-        plt.ylabel("Thrust coefficient $C_T$ [-]")
-        plt.title(f"{kind.capitalize()} interpolation of $C_T(U)$")
-        plt.grid(True, alpha=0.5)
-        plt.legend()
+        ax.plot(U_tab, Ct_tab, 'o', label='Look-up table')
+        ax.plot(U_fine, Ct_fine, '-', linewidth=2, label=f'Interp: {kind}')
+        ax.plot([ws], [Ct_at_U], 's', markersize=7, label=rf'calculated: $U={ws:.2f}$ m/s')
+
+        ax.set_xlabel("wind speed [m/s]")
+        ax.set_ylabel(r"thrust coeff $C_T$ [-]")
+        ax.set_title(r"$C_T(U)$ and current point")
+        ax.grid(True, alpha=0.5)
+
+        if show_arrows:
+            # vertical arrow
+            y_min, y_max = ax.get_ylim()
+            ax.annotate(
+                '', xy=(ws, Ct_at_U), xytext=(ws, y_min),
+                arrowprops=dict(arrowstyle='->', lw=1.5)
+            )
+            ax.text(ws, y_min, rf"$U={ws:.2f}$ m/s",
+                    ha='center', va='top', rotation=90, fontsize=9, color='black',
+                    bbox=dict(boxstyle="round,pad=0.2", fc='white', alpha=0.6))
+
+            # horizontal arrow
+            x_min, x_max = ax.get_xlim()
+            ax.annotate(
+                '', xy=(ws, Ct_at_U), xytext=(x_min, Ct_at_U),
+                arrowprops=dict(arrowstyle='->', lw=1.5)
+            )
+            ax.text(x_min, Ct_at_U, rf"$C_T={Ct_at_U:.3f}$",
+                    ha='left', va='bottom', fontsize=9, color='black',
+                    bbox=dict(boxstyle="round,pad=0.2", fc='white', alpha=0.6))
+
+        ax.legend(loc='best')
         plt.tight_layout()
-        plt.show()
+        if created_fig:
+            plt.show()
 
-    return get_Ct, U_tab, Ct_tab
-
-fullpath = os.path.join("inputs", "turbie_inputs", "CT.txt")
-
-# -------------plotting---------------
-get_Ct, U_tab, Ct_tab = Ct_look_up_and_interp(fullpath, kind='linear', plot=True)
-
-# ------------get_Ct function tested on a test w/s-------------------
-U_test = 10.5
-print(f"C_T({U_test:.1f} m/s) = {get_Ct(U_test):.3f}")
+    return Ct_at_U
 
 # building matrices
 # ---------- Dataclasses ----------
@@ -104,7 +134,7 @@ def load_parameters_from_listfile(path: str) -> tuple[RawListParams, TurbieParam
     # 2DOF Turbie model:
     # DOF1 = "rotore+blades" -> mass ~3*mb 
     # DOF2 = "nacelle+hub+tower" -> combined mass mn+mh+mt
-    m1 = 3.0 * mb
+    m1 = 3.0 * mb 
     m2 = mn + mh + mt
 
     params = TurbieParams(
@@ -180,37 +210,223 @@ def analyze_and_print_system(M: np.ndarray, C: np.ndarray, K: np.ndarray, raw: R
             else:
                 print(f"{fname}/{dname}: target fornito ma modi calcolati insufficienti.")
 
-# -------read parameters and build matrices using the functions------------
-param_path = os.path.join("inputs", "turbie_inputs", "turbie_parameters.txt")  
-raw, P = load_parameters_from_listfile(param_path)
-M, C, K = build_matrices(P)
 
-# print the matrices and checks comparing with fb/ft, drb/drt from input file
-analyze_and_print_system(M, C, K, raw=raw)
+def read_wind_file(base_folder: Path, wind_speed: int | float, TI: float):
+    """
+    reads wind_{wind_speed}_ms_TI_{TI:.1f}.txt
+    returns array N x 2: [time[s], U(t) m/s]
+    """
+    base_folder = Path(base_folder)
+    fileNameWS = f"wind_{int(wind_speed)}_ms_TI_{TI:.1f}.txt"
+    found_files = list(base_folder.rglob(fileNameWS))
+    if not found_files:
+        raise FileNotFoundError(f"Non trovato: {fileNameWS} in {base_folder}")
+    filePath = found_files[0]
+    data = np.loadtxt(filePath, comments="#", skiprows=1)
+    return data  # columns: t [s], U [m/s]
+
+def list_wind_cases(base_folder: Path, TI: float) -> list[Path]:
+    """
+    list of ws files 'wind_*_ms_TI_{TI:.1f}.txt' 
+    """
+    base_folder = Path(base_folder)
+    files = sorted(base_folder.rglob(f"wind_*_ms_TI_{TI:.1f}.txt"))
+    if not files:
+        raise FileNotFoundError(f"Nessun file wind_*_ms_TI_{TI:.1f}.txt trovato in {base_folder}")
+    return files
+
+def make_thrust_function(Ut: np.ndarray, rho: float, D: float, Ct_lookup_func):
+    """
+    calculates thrust F(t) = [T(t), 0]^T dove T(t) = 0.5 * rho * A * Ct(U(t)) * U(t)^2
+    Ut: array Nx2 with time and U(t)
+    Ct_lookup_func: funzione Ct(U) -> float
+    """
+    t_vec = Ut[:, 0]
+    U_vec = Ut[:, 1]
+    A = 0.25 * np.pi * D**2
+
+    # ilinear interp of U(t) 
+    U_of_t = interp1d(t_vec, U_vec, kind='linear', bounds_error=False,
+                      fill_value=(U_vec[0], U_vec[-1]))
+
+    def F_of_t(t: float) -> np.ndarray:
+        U = float(U_of_t(t))
+        Ct = float(Ct_lookup_func(U))
+        T = 0.5 * rho * A * Ct * U**2
+        # Assunzione: la forza aerodinamica agisce sul DOF1 (blades/rotore); DOF2 non forzato direttamente
+        return np.array([T, 0.0], dtype=float)
+
+    return F_of_t, (t_vec[0], t_vec[-1])
 
 
-# base = os.path.join("inputs", "wind_files")
+# === ADD: costruzione RHS y' = A y + B(t) per solve_ivp ===
+def make_rhs(M: np.ndarray, C: np.ndarray, K: np.ndarray, F_of_t):
+    """
+    Restituisce f(t, y) compatibile con solve_ivp.
+    Stato y = [x1, x2, v1, v2]^T (N=2 DOF)
+    """
+    n = M.shape[0]
+    Minv = np.linalg.inv(M)
+    Z = np.zeros_like(M)
+    I = np.eye(n)
 
-# # Controlla che la cartella esista
-# if not os.path.isdir(base):
-#     raise FileNotFoundError(f"Cartella non trovata: {base}")
+    A = np.vstack([np.hstack([Z, I]),
+                   np.hstack([-Minv @ K, -Minv @ C])])
 
-# # Scorre tutte le sottocartelle (es. wind_TI_0.05, wind_TI_0.10, ecc.)
-# for subfolder in sorted(os.listdir(base)):
-#     path = os.path.join(base, subfolder)
-#     if os.path.isdir(path):   # solo cartelle
-#         print(f"\n🔹 Cartella: {path}")
-#         txt_files = [f for f in os.listdir(path) if f.endswith(".txt")]
-#         if not txt_files:
-#             print("  (nessun file .txt trovato)")
-#             continue
+    def rhs(t: float, y: np.ndarray) -> np.ndarray:
+        # B(t) = [0; Minv * F(t)]
+        F = F_of_t(t)
+        B_top = np.zeros(n)
+        B_bot = Minv @ F
+        B = np.concatenate([B_top, B_bot])
+        return A @ y + B
 
-#         # Scorre tutti i file .txt dentro la sottocartella
-#         for file in sorted(txt_files):
-#             fullpath = os.path.join(path, file)
-#             try:
-#                 data = np.loadtxt(fullpath, comments="#", skiprows=1)
-#                 t, u = data[:,0], data[:,1]
-#                 print(f"  ✅ File: {file}  →  {data.shape[0]} righe, {data.shape[1] if data.ndim>1 else 1} colonne")
-#             except Exception as e:
-#                 print(f"  ⚠️ Errore nel leggere {file}: {e}")
+    return rhs
+
+
+# === ADD: integrazione di un singolo caso ===
+def simulate_turbie_case(M: np.ndarray, C: np.ndarray, K: np.ndarray,
+                         Ut: np.ndarray,
+                         Ct_path: str, kind: str,
+                         rho: float, D: float,
+                         y0: np.ndarray | None = None,
+                         rtol: float = 1e-6, atol: float = 1e-9):
+    """
+    Integra un caso con forzante da vento (Ut: [t, U]) e curva Ct(U) presa da file.
+    Ritorna dict con t, x1, x2, v1, v2, U.
+    """
+    # prepara Ct(U) come funzione (riuso di get_Ct ma senza plotting)
+    data = np.loadtxt(Ct_path, comments="#", skiprows=1)
+    U_tab, Ct_tab = data[:, 0], data[:, 1]
+    Ct_func = interp1d(U_tab, Ct_tab, kind=kind, bounds_error=False,
+                       fill_value=(Ct_tab[0], Ct_tab[-1]))
+
+    # F(t)
+    F_of_t, (t0, tf) = make_thrust_function(Ut, rho=rho, D=D, Ct_lookup_func=Ct_func)
+
+    # RHS
+    rhs = make_rhs(M, C, K, F_of_t)
+
+    # tempi di integrazione: uso la stessa griglia del vento (così è facile salvare)
+    t_eval = Ut[:, 0]
+    if y0 is None:
+        y0 = np.zeros(2* M.shape[0])  # [x1, x2, v1, v2] = 0
+
+    sol = solve_ivp(rhs, (t0, tf), y0, method='RK45', t_eval=t_eval,
+                    rtol=rtol, atol=atol, vectorized=False)
+
+    if not sol.success:
+        raise RuntimeError(f"solve_ivp non è riuscito: {sol.message}")
+
+    x1 = sol.y[0, :]
+    x2 = sol.y[1, :]
+    v1 = sol.y[2, :]
+    v2 = sol.y[3, :]
+    U  = Ut[:, 1]
+
+    return dict(t=sol.t, x1=x1, x2=x2, v1=v1, v2=v2, U=U)
+
+
+# === ADD: salvatore ===
+def save_time_history(out_path: Path, result: dict, meta: dict | None = None):
+    """
+    Salva su txt: t, U, x1, x2, v1, v2 (+ header).
+    """
+    out_path = Path(out_path)
+    arr = np.column_stack([result['t'], result['U'], result['x1'], result['x2'], result['v1'], result['v2']])
+    header = "t[s]\tU[m/s]\tx_blade[m]\tx_tower[m]\tv_blade[m/s]\tv_tower[m/s]"
+    if meta:
+        meta_str = " | ".join([f"{k}={v}" for k, v in meta.items()])
+        header = meta_str + "\n" + header
+    np.savetxt(out_path, arr, header=header, comments='', fmt="%.8e")
+
+
+# === ADD: statistiche ===
+def compute_stats(result: dict):
+    """
+    Ritorna mean/std delle displacement x1 (blade) e x2 (tower).
+    """
+    x1 = np.asarray(result['x1'])
+    x2 = np.asarray(result['x2'])
+    stats = {
+        'mean_blade': float(np.mean(x1)),
+        'std_blade' : float(np.std(x1, ddof=0)),
+        'mean_tower': float(np.mean(x2)),
+        'std_tower' : float(np.std(x2, ddof=0)),
+    }
+    return stats
+
+
+# === ADD: plot comparativo per un caso (vento + spostamenti) ===
+def plot_case_wind_and_displacements(result: dict, title: str = ""):
+    """
+    Due assi y: sinistra per x1,x2; destra per U(t).
+    """
+    t = result['t']; U = result['U']
+    x1 = result['x1']; x2 = result['x2']
+    fig, ax1 = plt.subplots(figsize=(9, 4.8))
+    ln1 = ax1.plot(t, x1, label="x_blade [m]", linewidth=1.5)
+    ln2 = ax1.plot(t, x2, label="x_tower [m]", linewidth=1.2, linestyle='--')
+    ax1.set_xlabel("time [s]")
+    ax1.set_ylabel("displacement [m]")
+    ax1.grid(True, alpha=0.4)
+
+    ax2 = ax1.twinx()
+    ln3 = ax2.plot(t, U, label="U(t) [m/s]", alpha=0.7)
+    ax2.set_ylabel("wind speed [m/s]")
+
+    # legende combinate
+    lines = ln1 + ln2 + ln3
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc='upper right')
+    if title:
+        ax1.set_title(title)
+    fig.tight_layout()
+    return fig
+
+
+# === ADD: salvataggio stats per TI ===
+def save_stats_per_TI(out_path: Path, rows: list[dict]):
+    """
+    rows: lista di dict con chiavi: TI, U_mean, mean_blade, std_blade, mean_tower, std_tower
+    """
+    out_path = Path(out_path)
+    header = "TI\tU_mean[m/s]\tmean_blade[m]\tstd_blade[m]\tmean_tower[m]\tstd_tower[m]"
+    arr = np.array([[r['TI'], r['U_mean'], r['mean_blade'], r['std_blade'], r['mean_tower'], r['std_tower']]
+                    for r in rows], dtype=float)
+    np.savetxt(out_path, arr, header=header, comments='', fmt="%.8e")
+
+
+# === ADD: plot mean/std vs vento per una TI ===
+def plot_stats_vs_wind(TI: float, rows: list[dict]):
+    """
+    Due grafici: (1) mean vs U_mean, (2) std vs U_mean
+    """
+    U = np.array([r['U_mean'] for r in rows])
+    mean_b = np.array([r['mean_blade'] for r in rows])
+    mean_t = np.array([r['mean_tower'] for r in rows])
+    std_b  = np.array([r['std_blade'] for r in rows])
+    std_t  = np.array([r['std_tower'] for r in rows])
+
+    # means
+    fig1, ax1 = plt.subplots(figsize=(7.5, 4))
+    ax1.plot(U, mean_b, 'o-', label='mean blade [m]')
+    ax1.plot(U, mean_t, 's--', label='mean tower [m]')
+    ax1.set_xlabel("U_mean [m/s]")
+    ax1.set_ylabel("mean displacement [m]")
+    ax1.set_title(f"Means vs wind | TI={TI:.2f}")
+    ax1.grid(True, alpha=0.4)
+    ax1.legend()
+    fig1.tight_layout()
+
+    # std
+    fig2, ax2 = plt.subplots(figsize=(7.5, 4))
+    ax2.plot(U, std_b, 'o-', label='std blade [m]')
+    ax2.plot(U, std_t, 's--', label='std tower [m]')
+    ax2.set_xlabel("U_mean [m/s]")
+    ax2.set_ylabel("std displacement [m]")
+    ax2.set_title(f"Standard deviations vs wind | TI={TI:.2f}")
+    ax2.grid(True, alpha=0.4)
+    ax2.legend()
+    fig2.tight_layout()
+    return fig1, fig2
